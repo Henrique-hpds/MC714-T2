@@ -1,5 +1,6 @@
 """API de tarefas, coordenação e replicação entre os nós."""
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -14,6 +15,7 @@ from app.algorithms.heartbeat import Heartbeat
 from app.algorithms.replication import PrimaryBackup
 from app.communication.client import NodeClient
 from app.errors import ProtocolError
+from app.metrics import Metrics
 from app.models import (
     CommitMessage, ConfigurationAck, ConfigurationMessage, CoordinatorMessage,
     ElectionMessage, HeartbeatMessage, OperationRecord, PrepareMessage, RecoveryState, ReplicationAck,
@@ -21,6 +23,9 @@ from app.models import (
 )
 from app.state import NodeState
 from app.storage.database import Database
+
+# Logs da aplicação no stdout do contêiner (o uvicorn só configura os próprios loggers).
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 class InternalMessage(BaseModel):
     sender_id: int = Field(strict=True, gt=0)
@@ -38,7 +43,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async with httpx.AsyncClient(timeout=config.request_timeout, trust_env=False) as client:
                 app.state.client = client
                 app.state.node = NodeState(config.node_id, epoch=database.max_epoch(), configuration=database.load_configuration())
-                node_client = NodeClient(config, client)
+                app.state.metrics = Metrics(config.node_id)
+                node_client = NodeClient(config, client, app.state.metrics)
                 app.state.bully = Bully(config, app.state.node, node_client)
                 app.state.heartbeat = Heartbeat(config, app.state.node, node_client, app.state.bully.start_election)
                 app.state.replication = PrimaryBackup(config, app.state.node, node_client, database, lambda: app.state.heartbeat.suspected_nodes)
@@ -113,6 +119,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/internal/recovery/configure", response_model=ConfigurationAck)
     async def configure_replication(message: ConfigurationMessage, request: Request):
         return await request.app.state.replication.receive_configuration(message)
+
+    @app.get("/metrics")
+    async def metrics(request: Request, since: float = 0.0):
+        # Contadores acumulados e eventos com horário (time.time()) para os experimentos.
+        return request.app.state.metrics.snapshot(since)
 
     @app.get("/health")
     async def health(request: Request):

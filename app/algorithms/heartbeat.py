@@ -38,6 +38,7 @@ class Heartbeat:
         
         if sender_id in self.suspected_nodes:
             self.suspected_nodes.remove(sender_id)
+            self.client.metrics.event("UNSUSPECTED", peer=sender_id)
             
             if self._last_failed_leader is not None and self._last_failed_leader[0] == sender_id:
                 self._last_failed_leader = None
@@ -65,6 +66,9 @@ class Heartbeat:
         for peer_id, last_received in self.last_received.items():
             if now - last_received > self.settings.failure_timeout and peer_id not in self.suspected_nodes:
                 self.suspected_nodes.add(peer_id)
+                # silence: tempo local desde o último heartbeat recebido do participante.
+                self.client.metrics.event("SUSPECTED", peer=peer_id, silence=now - last_received,
+                                          is_leader=peer_id == self.state.leader_id)
                 logger.info("SUSPECTED node=%s peer=%s", self.state.node_id, peer_id)
 
         leader_id = self.state.leader_id

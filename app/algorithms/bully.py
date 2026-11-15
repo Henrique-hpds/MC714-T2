@@ -63,6 +63,7 @@ class Bully:
         
         self.state.recognize_leader(message.leader_id, message.epoch)
         self._changed.set()
+        self.client.metrics.event("LEADER_RECOGNIZED", leader=message.leader_id, epoch=message.epoch)
         logger.info("COORDINATOR node=%s leader=%s epoch=%s", self.state.node_id, message.leader_id, message.epoch)
         
         return True
@@ -73,6 +74,7 @@ class Bully:
             epoch = self.state.epoch
             self._changed.clear()
             logger.info("ELECTION node=%s epoch=%s", self.state.node_id, epoch)
+            self.client.metrics.event("ELECTION_ROUND", epoch=epoch)
             
             answers = await asyncio.gather(
                 *(self.client.send_election(peer_id, epoch) for peer_id in self.settings.peers if peer_id > self.state.node_id)
@@ -92,6 +94,7 @@ class Bully:
             if not any(answer is not None for answer in answers):
                 self.state.recognize_leader(self.state.node_id, epoch)
                 logger.info("LEADER_ELECTED node=%s epoch=%s", self.state.node_id, epoch)
+                self.client.metrics.event("LEADER_RECOGNIZED", leader=self.state.node_id, epoch=epoch)
                 
                 await asyncio.gather(
                     *(self.client.send_coordinator(peer_id, epoch) for peer_id in self.settings.peers if peer_id != self.state.node_id)

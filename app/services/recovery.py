@@ -76,7 +76,7 @@ class Recovery:
         
         try:
             # Cerca a liderança anterior também na reconfiguração de backups.
-            await self._all(self.client.send_coordinator(peer, configuration.epoch) for peer in backups)
+            await self._all(self.client.send_coordinator(peer, configuration.epoch, "FENCE") for peer in backups)
             self._require_candidate(configuration)
             snapshots = await self._all(self.client.recovery_state(peer) for peer in backups)
             
@@ -117,6 +117,7 @@ class Recovery:
             self.state.synchronized = True
             self.state.role = "PRIMARY"
            
+            self.client.metrics.event("PRIMARY", epoch=configuration.epoch, members=list(configuration.members), recovered=len(operations))
             logger.info("PRIMARY node=%s epoch=%s members=%s recovered=%s", self.state.node_id, configuration.epoch, configuration.members, len(operations))
         except (NodeUnavailable, ProtocolError) as error:
             logger.debug("Recuperação pendente node=%s: %s", self.state.node_id, error)

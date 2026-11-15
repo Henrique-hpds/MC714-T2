@@ -7,3 +7,5 @@
 tests
 experiments
 *.md
+__pycache__
+experiments/results
