@@ -1,0 +1,54 @@
+services:
+  node1:
+    build: .
+    # Mantém o nó parado após uma falha nos ensaios de crash-stop.
+    restart: "no"
+    environment:
+      NODE_ID: "1"
+      PEERS: "1=http://node1:8000,2=http://node2:8000,3=http://node3:8000"
+      DB_PATH: "/data/tasks.db"
+    ports:
+      - "8001:8000"
+    volumes:
+      - node1_data:/data
+    healthcheck: &node-healthcheck
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=1).close()"
+      interval: 5s
+      timeout: 2s
+      start_period: 5s
+      retries: 5
+
+  node2:
+    build: .
+    restart: "no"
+    environment:
+      NODE_ID: "2"
+      PEERS: "1=http://node1:8000,2=http://node2:8000,3=http://node3:8000"
+      DB_PATH: "/data/tasks.db"
+    ports:
+      - "8002:8000"
+    volumes:
+      - node2_data:/data
+    healthcheck: *node-healthcheck
+
+  node3:
+    build: .
+    restart: "no"
+    environment:
+      NODE_ID: "3"
+      PEERS: "1=http://node1:8000,2=http://node2:8000,3=http://node3:8000"
+      DB_PATH: "/data/tasks.db"
+    ports:
+      - "8003:8000"
+    volumes:
+      - node3_data:/data
+    healthcheck: *node-healthcheck
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
