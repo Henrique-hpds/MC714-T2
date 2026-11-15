@@ -1,5 +1,6 @@
 """Configuração de uma instância a partir das variáveis do Compose."""
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,14 @@ class Settings:
     node_id: int
     peers: dict[int, str]
     db_path: Path
+    request_timeout: float = 1.0
+    coordinator_timeout: float = 3.0
+
+    def __post_init__(self) -> None:
+        for name in ("request_timeout", "coordinator_timeout"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} deve ser positivo e finito")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,4 +44,10 @@ class Settings:
         if not os.environ["DB_PATH"].strip():
             raise ValueError("DB_PATH não pode ser vazio")
 
-        return cls(node_id=node_id, peers=peers, db_path=Path(os.environ["DB_PATH"]))
+        return cls(
+            node_id=node_id,
+            peers=peers,
+            db_path=Path(os.environ["DB_PATH"]),
+            request_timeout=float(os.environ.get("REQUEST_TIMEOUT", "1.0")),
+            coordinator_timeout=float(os.environ.get("COORDINATOR_TIMEOUT", "3.0"))
+        )

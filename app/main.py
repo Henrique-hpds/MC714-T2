@@ -1,4 +1,4 @@
-"""API inicial para verificar a comunicação entre os nós."""
+"""API de comunicação e eleição de coordenador entre os nós."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -8,6 +8,10 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.config import Settings
+from app.algorithms.bully import Bully
+from app.communication.client import NodeClient
+from app.models import CoordinatorMessage, ElectionMessage
+from app.state import NodeState
 
 class InternalMessage(BaseModel):
     sender_id: int = Field(strict=True, gt=0)
@@ -18,9 +22,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         app.state.settings = settings if settings is not None else Settings.from_env()
         # Comunicação direta entre nós, sem proxies configurados no ambiente.
-        async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
+        config = app.state.settings
+        async with httpx.AsyncClient(timeout=config.request_timeout, trust_env=False) as client:
             app.state.client = client
-            yield
+            app.state.node = NodeState(config.node_id)
+            app.state.bully = Bully(config, app.state.node, NodeClient(config, client))
+            app.state.bully.start_election()
+            try:
+                yield
+            finally:
+                await app.state.bully.close()
 
     app = FastAPI(title="Distributed Task Manager", lifespan=lifespan)
 
@@ -50,18 +61,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         
         return {
-            "node_id": config.node_id,
-            "role": "UNASSIGNED",
-            "leader_id": None,
-            "active_nodes": sorted([config.node_id] + [peer_id for peer_id in responding if peer_id is not None]),
-            "epoch": 0
+            **request.app.state.node.snapshot(),
+            "active_nodes": sorted([config.node_id] + [peer_id for peer_id in responding if peer_id is not None])
         }
+
+    @app.post("/internal/election/start", status_code=202)
+    async def start_election(request: Request):
+        request.app.state.bully.start_election()
+        return request.app.state.node.snapshot()
+
+    @app.post("/internal/election")
+    async def receive_election(message: ElectionMessage, request: Request):
+        config = request.app.state.settings
+        
+        if message.sender_id not in config.peers or message.sender_id >= config.node_id:
+            raise HTTPException(status_code=400, detail="ELECTION deve vir de participante com ID menor")
+        
+        return request.app.state.bully.receive_election(message)
+
+    @app.post("/internal/coordinator")
+    async def receive_coordinator(message: CoordinatorMessage, request: Request):
+        config = request.app.state.settings
+        
+        if message.leader_id not in config.peers or message.leader_id == config.node_id:
+            raise HTTPException(status_code=400, detail="Coordenador deve ser outro participante de PEERS")
+        
+        accepted = request.app.state.bully.receive_coordinator(message)
+        return {"accepted": accepted, **request.app.state.node.snapshot()}
 
     @app.post("/internal/message")
     async def receive_message(message: InternalMessage, request: Request):
         config = request.app.state.settings
+        
         if message.sender_id not in config.peers:
             raise HTTPException(status_code=400, detail="Remetente não pertence a PEERS")
+        
         return {
             "status": "received",
             "node_id": config.node_id,
