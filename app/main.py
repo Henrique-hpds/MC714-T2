@@ -1,4 +1,4 @@
-"""API de comunicação e eleição de coordenador entre os nós."""
+"""API de comunicação, eleição e detecção de falhas entre os nós."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -9,8 +9,9 @@ from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.algorithms.bully import Bully
+from app.algorithms.heartbeat import Heartbeat
 from app.communication.client import NodeClient
-from app.models import CoordinatorMessage, ElectionMessage
+from app.models import CoordinatorMessage, ElectionMessage, HeartbeatMessage
 from app.state import NodeState
 
 class InternalMessage(BaseModel):
@@ -26,11 +27,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with httpx.AsyncClient(timeout=config.request_timeout, trust_env=False) as client:
             app.state.client = client
             app.state.node = NodeState(config.node_id)
-            app.state.bully = Bully(config, app.state.node, NodeClient(config, client))
+            node_client = NodeClient(config, client)
+            app.state.bully = Bully(config, app.state.node, node_client)
+            app.state.heartbeat = Heartbeat(
+                config, app.state.node, node_client, app.state.bully.start_election
+            )
             app.state.bully.start_election()
+            app.state.heartbeat.start()
             try:
                 yield
             finally:
+                await app.state.heartbeat.close()
                 await app.state.bully.close()
 
     app = FastAPI(title="Distributed Task Manager", lifespan=lifespan)
@@ -62,8 +69,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         
         return {
             **request.app.state.node.snapshot(),
-            "active_nodes": sorted([config.node_id] + [peer_id for peer_id in responding if peer_id is not None])
+            "active_nodes": sorted([config.node_id] + [peer_id for peer_id in responding if peer_id is not None]),
+            "suspected_nodes": sorted(request.app.state.heartbeat.suspected_nodes),
         }
+
+    @app.post("/internal/heartbeat")
+    async def receive_heartbeat(message: HeartbeatMessage, request: Request):
+        config = request.app.state.settings
+        if message.sender_id not in config.peers or message.sender_id == config.node_id:
+            raise HTTPException(status_code=400, detail="Heartbeat deve vir de outro participante de PEERS")
+        request.app.state.heartbeat.receive(message.sender_id)
+        return {"status": "received", "node_id": config.node_id}
 
     @app.post("/internal/election/start", status_code=202)
     async def start_election(request: Request):

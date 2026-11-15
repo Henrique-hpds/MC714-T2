@@ -1,4 +1,4 @@
-"""Mensagens HTTP do protocolo Bully."""
+"""Mensagens HTTP dos protocolos Bully e Heartbeat."""
 from typing import Literal
 from pydantic import BaseModel, Field
 
@@ -14,3 +14,6 @@ class ElectionOK(BaseModel):
 class CoordinatorMessage(BaseModel):
     leader_id: int = Field(strict=True, gt=0)
     epoch: int = Field(strict=True, ge=1)
+
+class HeartbeatMessage(BaseModel):
+    sender_id: int = Field(strict=True, gt=0)

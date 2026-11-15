@@ -13,9 +13,11 @@ class Settings:
     db_path: Path
     request_timeout: float = 1.0
     coordinator_timeout: float = 3.0
+    heartbeat_interval: float = 0.5
+    failure_timeout: float = 3.0
 
     def __post_init__(self) -> None:
-        for name in ("request_timeout", "coordinator_timeout"):
+        for name in ("request_timeout", "coordinator_timeout", "heartbeat_interval", "failure_timeout"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} deve ser positivo e finito")
@@ -49,5 +51,7 @@ class Settings:
             peers=peers,
             db_path=Path(os.environ["DB_PATH"]),
             request_timeout=float(os.environ.get("REQUEST_TIMEOUT", "1.0")),
-            coordinator_timeout=float(os.environ.get("COORDINATOR_TIMEOUT", "3.0"))
+            coordinator_timeout=float(os.environ.get("COORDINATOR_TIMEOUT", "3.0")),
+            heartbeat_interval=float(os.environ.get("HEARTBEAT_INTERVAL", "0.5")),
+            failure_timeout=float(os.environ.get("FAILURE_TIMEOUT", "3.0")),
         )

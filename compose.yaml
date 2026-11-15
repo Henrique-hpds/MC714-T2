@@ -7,6 +7,8 @@ services:
       NODE_ID: "1"
       PEERS: "1=http://node1:8000,2=http://node2:8000,3=http://node3:8000"
       DB_PATH: "/data/tasks.db"
+      HEARTBEAT_INTERVAL: "0.5"
+      FAILURE_TIMEOUT: "3.0"
     ports:
       - "8001:8000"
     volumes:
@@ -29,6 +31,8 @@ services:
       NODE_ID: "2"
       PEERS: "1=http://node1:8000,2=http://node2:8000,3=http://node3:8000"
       DB_PATH: "/data/tasks.db"
+      HEARTBEAT_INTERVAL: "0.5"
+      FAILURE_TIMEOUT: "3.0"
     ports:
       - "8002:8000"
     volumes:
@@ -42,6 +46,8 @@ services:
       NODE_ID: "3"
       PEERS: "1=http://node1:8000,2=http://node2:8000,3=http://node3:8000"
       DB_PATH: "/data/tasks.db"
+      HEARTBEAT_INTERVAL: "0.5"
+      FAILURE_TIMEOUT: "3.0"
     ports:
       - "8003:8000"
     volumes:
