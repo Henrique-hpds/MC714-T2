@@ -4,9 +4,17 @@ import logging
 
 import httpx
 from app.config import Settings
-from app.models import CoordinatorMessage, ElectionMessage, ElectionOK, HeartbeatMessage
+from app.models import (
+    CommitMessage, CoordinatorMessage, ElectionMessage, ElectionOK, HeartbeatMessage,
+    Operation, PrepareMessage, ReplicationAck, ReplicationState,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class NodeUnavailable(Exception):
+    """O destino não forneceu uma resposta válida no prazo."""
+
 
 class NodeClient:
     def __init__(self, settings: Settings, client: httpx.AsyncClient):
@@ -50,3 +58,41 @@ class NodeClient:
             response.raise_for_status()
         except httpx.HTTPError:
             logger.debug("COORDINATOR não entregue: node=%s peer=%s", self.settings.node_id, peer_id)
+
+    async def replication_state(self, peer_id: int) -> ReplicationState:
+        try:
+            async with asyncio.timeout(self.settings.request_timeout):
+                response = await self.client.get(f"{self.settings.peers[peer_id]}/internal/replication/state", timeout=self.settings.request_timeout)
+                response.raise_for_status()
+                state = ReplicationState.model_validate(response.json())
+            
+                if state.node_id != peer_id:
+                    raise ValueError("Estado recebido de outro participante")
+                return state
+            
+        except (httpx.HTTPError, ValueError, TimeoutError) as error:
+            raise NodeUnavailable(f"Estado de replicação indisponível: node={peer_id}") from error
+
+    async def _replicate(self, peer_id: int, phase: str, operation: Operation) -> ReplicationAck:
+        
+        if phase == "prepare":
+            message = PrepareMessage(sender_id=self.settings.node_id, operation=operation)
+        else:
+            message = CommitMessage(sender_id=self.settings.node_id, request_id=operation.request_id, epoch=operation.epoch, sequence_number=operation.sequence_number)
+        try:
+            async with asyncio.timeout(self.settings.request_timeout):
+                response = await self.client.post(f"{self.settings.peers[peer_id]}/internal/replication/{phase}", json=message.model_dump(), timeout=self.settings.request_timeout)
+                response.raise_for_status()
+                ack = ReplicationAck.model_validate(response.json())
+                if (ack.node_id != peer_id or ack.request_id != operation.request_id or ack.epoch != operation.epoch or ack.sequence_number != operation.sequence_number or (phase == "commit" and ack.status != "COMMITTED")):
+                    raise ValueError("ACK não corresponde à operação enviada")
+                return ack
+  
+        except (httpx.HTTPError, ValueError, TimeoutError) as error:
+            raise NodeUnavailable(f"{phase.upper()} sem ACK válido: node={peer_id}") from error
+
+    async def send_prepare(self, peer_id: int, operation: Operation) -> ReplicationAck:
+        return await self._replicate(peer_id, "prepare", operation)
+
+    async def send_commit(self, peer_id: int, operation: Operation) -> ReplicationAck:
+        return await self._replicate(peer_id, "commit", operation)

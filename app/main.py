@@ -1,18 +1,26 @@
-"""API de comunicação, eleição e detecção de falhas entre os nós."""
+"""API de tarefas, coordenação e replicação entre os nós."""
 
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.algorithms.bully import Bully
 from app.algorithms.heartbeat import Heartbeat
+from app.algorithms.replication import PrimaryBackup
 from app.communication.client import NodeClient
-from app.models import CoordinatorMessage, ElectionMessage, HeartbeatMessage
+from app.errors import ProtocolError
+from app.models import (
+    CommitMessage, CoordinatorMessage, ElectionMessage, HeartbeatMessage,
+    PrepareMessage, ReplicationAck, ReplicationState, RequestID, Task, TaskCreate, TaskUpdate,
+)
 from app.state import NodeState
+from app.storage.database import Database
 
 class InternalMessage(BaseModel):
     sender_id: int = Field(strict=True, gt=0)
@@ -24,23 +32,73 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings if settings is not None else Settings.from_env()
         # Comunicação direta entre nós, sem proxies configurados no ambiente.
         config = app.state.settings
-        async with httpx.AsyncClient(timeout=config.request_timeout, trust_env=False) as client:
-            app.state.client = client
-            app.state.node = NodeState(config.node_id)
-            node_client = NodeClient(config, client)
-            app.state.bully = Bully(config, app.state.node, node_client)
-            app.state.heartbeat = Heartbeat(
-                config, app.state.node, node_client, app.state.bully.start_election
-            )
-            app.state.bully.start_election()
-            app.state.heartbeat.start()
-            try:
-                yield
-            finally:
-                await app.state.heartbeat.close()
-                await app.state.bully.close()
+        database = Database(config.db_path)
+        app.state.database = database
+        try:
+            async with httpx.AsyncClient(timeout=config.request_timeout, trust_env=False) as client:
+                app.state.client = client
+                app.state.node = NodeState(config.node_id, epoch=database.max_epoch())
+                node_client = NodeClient(config, client)
+                app.state.bully = Bully(config, app.state.node, node_client)
+                app.state.heartbeat = Heartbeat(
+                    config, app.state.node, node_client, app.state.bully.start_election
+                )
+                app.state.replication = PrimaryBackup(config, app.state.node, node_client, database)
+                app.state.bully.start_election()
+                app.state.heartbeat.start()
+                app.state.replication.start()
+                try:
+                    yield
+                finally:
+                    await app.state.replication.close()
+                    await app.state.heartbeat.close()
+                    await app.state.bully.close()
+        finally:
+            database.close()
 
     app = FastAPI(title="Distributed Task Manager", lifespan=lifespan)
+
+    @app.exception_handler(ProtocolError)
+    async def protocol_error(request: Request, error: ProtocolError):
+        node = request.app.state.node
+        body = {
+            "detail": error.detail,
+            "leader_id": node.leader_id,
+            "leader_url": request.app.state.settings.peers.get(node.leader_id),
+        }
+        headers = {}
+        if error.request_id is not None:
+            body["request_id"] = error.request_id
+            headers["Idempotency-Key"] = error.request_id
+        return JSONResponse(status_code=error.status_code, content=body, headers=headers)
+
+    @app.post("/tasks", response_model=Task, status_code=201)
+    async def create_task(command: TaskCreate, request: Request, response: Response, request_id: Annotated[RequestID | None, Header(alias="Idempotency-Key")] = None):
+        task, key = await request.app.state.replication.write(command, None, request_id)
+        response.headers["Idempotency-Key"] = key
+        return task
+
+    @app.get("/tasks", response_model=list[Task])
+    async def list_tasks(request: Request):
+        return await request.app.state.replication.list_tasks()
+
+    @app.put("/tasks/{task_id}", response_model=Task)
+    async def update_task(task_id: str, command: TaskUpdate, request: Request, response: Response, request_id: Annotated[RequestID | None, Header(alias="Idempotency-Key")] = None):
+        task, key = await request.app.state.replication.write(command, task_id, request_id)
+        response.headers["Idempotency-Key"] = key
+        return task
+
+    @app.get("/internal/replication/state", response_model=ReplicationState)
+    async def replication_state(request: Request):
+        return request.app.state.replication.snapshot()
+
+    @app.post("/internal/replication/prepare", response_model=ReplicationAck)
+    async def receive_prepare(message: PrepareMessage, request: Request):
+        return await request.app.state.replication.receive_prepare(message)
+
+    @app.post("/internal/replication/commit", response_model=ReplicationAck)
+    async def receive_commit(message: CommitMessage, request: Request):
+        return await request.app.state.replication.receive_commit(message)
 
     @app.get("/health")
     async def health(request: Request):
@@ -63,14 +121,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return None
 
         # Um nó indisponível não bloqueia as consultas aos demais participantes.
-        responding = await asyncio.gather(
-            *(check_peer(peer_id, url) for peer_id, url in config.peers.items() if peer_id != config.node_id)
-        )
+        responding = await asyncio.gather(*(check_peer(peer_id, url) for peer_id, url in config.peers.items() if peer_id != config.node_id))
         
         return {
             **request.app.state.node.snapshot(),
             "active_nodes": sorted([config.node_id] + [peer_id for peer_id in responding if peer_id is not None]),
             "suspected_nodes": sorted(request.app.state.heartbeat.suspected_nodes),
+            "replication_members": sorted(config.peers)
         }
 
     @app.post("/internal/heartbeat")

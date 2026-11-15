@@ -1,4 +1,4 @@
-"""Estado local de coordenação; a eleição ainda não ativa o primário."""
+"""Estado local; a replicação ativa PRIMARY depois de validar todos os membros."""
 from dataclasses import dataclass
 
 @dataclass

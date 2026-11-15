@@ -20,14 +20,15 @@ curl http://localhost:8001/status
 
 Com os três nós disponíveis, o Bully é iniciado automaticamente e elege o Node 3.
 Após a convergência, `/status` retorna `active_nodes: [1, 2, 3]`, `leader_id: 3`
-e o mesmo `epoch` nos três nós. O vencedor tem papel `LEADER_ELECTED` e os
-outros têm papel `BACKUP`. Durante a eleição, o papel é `ELECTING` e não há líder.
-O vencedor ainda não assume `PRIMARY`: a ativação depende da sincronização de
-dados prevista nas próximas etapas.
+e o mesmo `epoch` nos três nós. O vencedor passa de `LEADER_ELECTED` a `PRIMARY`
+depois de verificar que todos os participantes reconhecem a liderança e possuem
+logs e tarefas iguais, sem operações pendentes. Os outros têm papel `BACKUP`.
+Durante a eleição, o papel é `ELECTING` e não há líder. Aguarde `PRIMARY` antes
+de enviar operações de tarefas; o healthcheck só indica que a API está acessível.
 O endpoint `POST /internal/message` recebe mensagens com `sender_id` e `message`.
 
 A configuração está em `compose.yaml`: `NODE_ID` identifica o nó, `PEERS` define
-os participantes e `DB_PATH` reserva o caminho do SQLite em um volume por nó.
+os participantes e `DB_PATH` define o caminho do SQLite em um volume por nó.
 `REQUEST_TIMEOUT` (padrão: `1.0` segundo) limita cada envio HTTP e
 `COORDINATOR_TIMEOUT` (padrão: `3.0` segundos) limita a espera pelo coordenador
 após receber um `OK`. `HEARTBEAT_INTERVAL` (padrão: `0.5` segundo) controla o
@@ -53,8 +54,9 @@ responder `OK` mas o anúncio não chegar a tempo, uma nova rodada é iniciada.
 As mensagens do protocolo usam IDs de `PEERS` e epochs inteiros positivos.
 `ELECTION` deve vir de um ID menor que o destinatário. Os anúncios de epochs
 antigos são ignorados; um nó de ID maior contesta candidatos de ID menor.
-O `epoch` identifica a rodada em memória e não é uma configuração persistente
-de replicação nesta etapa.
+O `epoch` identifica a liderança reconhecida e acompanha as mensagens de
+replicação. Na inicialização, o maior epoch do log persistido serve como piso
+para a eleição. A configuração de membros desta etapa é fixa: todos em `PEERS`.
 
 ## Heartbeat — Etapa 3
 
@@ -97,6 +99,87 @@ compatíveis com os timeouts. Bully e Heartbeat não oferecem consenso ou prote�
 contra split-brain fora desse modelo.
 
 Para restaurar os três nós após o ensaio, execute `docker compose up -d --wait`.
+Se houver operações incompletas ou dados divergentes, a ativação permanece
+suspensa: recuperação e reintegração automática pertencem à Etapa 5.
+
+## Primary-Backup — Etapa 4
+
+Somente o `PRIMARY` atende leituras e escritas de tarefas. Um backup responde
+HTTP 409 com `leader_id` e `leader_url`; esse endereço usa o DNS interno de
+`PEERS` (no host, use a porta correspondente, por exemplo `8003` para Node 3).
+Durante eleição ou ativação pendente, o candidato responde HTTP 503.
+
+| Endpoint | Corpo | Resultado |
+|---|---|---|
+| `POST /tasks` | `{"title": "Implementar replicação"}` | Tarefa criada, HTTP 201 |
+| `GET /tasks` | Sem corpo | Lista de tarefas confirmadas |
+| `PUT /tasks/{id}` | `{"status": "completed"}` | Tarefa atualizada, HTTP 200 |
+
+As tarefas têm `id`, `title`, `status` e `version`. Os estados permitidos são
+`pending` (padrão), `in_progress` e `completed`. Uma atualização informa título,
+status ou ambos; a versão inicia em 1 e aumenta uma vez por atualização.
+Campos desconhecidos, títulos vazios e atualizações vazias ou nulas retornam
+HTTP 422. Atualizar uma tarefa inexistente retorna HTTP 404.
+
+```bash
+curl -i -X POST http://localhost:8003/tasks \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: request-001' \
+  -d '{"title": "Implementar Primary-Backup"}'
+
+curl http://localhost:8003/tasks
+
+# Substitua TASK_ID pelo id retornado na criação.
+curl -X PUT http://localhost:8003/tasks/TASK_ID \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: request-002' \
+  -d '{"status": "completed"}'
+```
+
+Use uma `Idempotency-Key` única por operação. Ao repetir a mesma entrada com a
+mesma chave, o sistema devolve o resultado original sem reaplicar a operação.
+Reutilizar a chave com outra entrada, outro tipo de operação ou outra tarefa
+retorna HTTP 409. Se omitida, uma chave é gerada e devolvida no cabeçalho da
+resposta; enviá-la explicitamente permite repetir a operação mesmo se a conexão
+cair antes de o cliente receber a resposta.
+
+As escritas são serializadas com `asyncio.Lock`. O primário persiste a operação
+como `PREPARED` e envia PREPARE concorrentemente a todos os backups. Depois de
+receber todos os ACKs, envia COMMIT e aguarda todos os COMMIT ACKs. Só então
+confirma localmente e responde ao cliente. Cada nó mantém tabelas `tasks` e
+`operations` em SQLite, com unicidade de `request_id` e de `(epoch,
+sequence_number)`. Aplicar uma tarefa e marcar sua operação `COMMITTED` ocorre
+na mesma transação. PREPARE não altera a tabela de tarefas.
+
+Os envios têm limite total de `REQUEST_TIMEOUT`, e os ACKs são conferidos por
+nó, requisição, epoch, sequência e fase. Backups rejeitam mensagens de outro
+remetente ou epoch, COMMIT sem PREPARE e operações fora de ordem ou com versão
+incompatível. PREPARE e COMMIT repetidos são idempotentes. Essas duas fases são
+parte da replicação Primary-Backup; não constituem uma implementação completa
+de 2PC.
+
+Se faltar qualquer ACK, a API retorna HTTP 503 com `request_id` e mantém a
+operação pendente. O resultado pode ser desconhecido: algum backup pode já ter
+aplicado o COMMIT. Repita a mesma entrada e chave para concluir a operação na
+mesma liderança. Enquanto houver uma operação pendente, novas escritas e
+leituras ficam suspensas, evitando exposição de uma escrita ainda incompleta.
+
+A configuração permanece fixa em todos os nós de `PEERS`, apresentada como
+`replication_members` em `/status`. `active_nodes` e `suspected_nodes` não mudam
+essa configuração. A falha de um backup impede confirmar escritas; a falha do
+primário ainda permite eleger um substituto, mas ele fica em `LEADER_ELECTED`
+porque não consegue validar todos os membros. Os dados confirmados permanecem
+nos bancos sobreviventes. Recuperar operações pendentes, sincronizar bancos
+divergentes e ativar uma nova configuração com menos membros são tarefas da
+Etapa 5.
+
+Endpoints internos usados pelo protocolo:
+
+| Endpoint | Função |
+|---|---|
+| `GET /internal/replication/state` | Liderança, hashes dos logs e tarefas e presença de operações pendentes |
+| `POST /internal/replication/prepare` | Persistir a operação antes de responder ACK |
+| `POST /internal/replication/commit` | Aplicar tarefa e confirmar operação antes de responder COMMIT ACK |
 
 ## Testes
 
@@ -112,6 +195,10 @@ inicial, falhas do líder e de backup, eleições simultâneas, perda e atraso d
 Também cobrem a eleição automática após falha do líder, suspeitas de backup sem
 nova eleição, expiração e renovação dos heartbeats, isolamento de destinos lentos,
 validação da configuração e cancelamento de envios pendentes.
+Os testes de Primary-Backup usam um SQLite temporário independente por nó e
+cobrem persistência, atomicidade, criação e atualização, versões, serialização,
+idempotência, perda e falsificação de ACKs, timeouts, cancelamento, mudança de
+liderança durante escrita e bloqueio de ativação com logs divergentes.
 
 Com os três contêineres em execução, valide também a comunicação pelo DNS do Compose:
 
@@ -126,8 +213,11 @@ Para um ensaio completo com processos independentes, execute:
 ```
 
 Esse script cria um projeto Compose isolado, sem portas publicadas ou volumes
-do ambiente de desenvolvimento. Verifica a eleição inicial, eleições
-simultâneas e a eleição dos Nodes 2 e 1 após interromper os líderes anteriores.
+do ambiente de desenvolvimento. Verifica a ativação inicial do primário,
+criação e atualização de tarefas, idempotência e igualdade dos registros nos
+três nós. Também verifica eleições simultâneas e a eleição dos Nodes 2 e 1
+após interromper os líderes anteriores, preservando os dados confirmados e
+mantendo novas escritas suspensas até a implementação da Etapa 5.
 As eleições após falhas são acionadas automaticamente pelo Heartbeat, sem usar
 `/internal/election/start`. Os contêineres e a rede do ensaio são removidos ao final.
 
