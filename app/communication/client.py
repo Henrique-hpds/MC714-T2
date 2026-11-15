@@ -5,8 +5,9 @@ import logging
 import httpx
 from app.config import Settings
 from app.models import (
-    CommitMessage, CoordinatorMessage, ElectionMessage, ElectionOK, HeartbeatMessage,
-    Operation, PrepareMessage, ReplicationAck, ReplicationState,
+    CommitMessage, ConfigurationAck, ConfigurationMessage, CoordinatorMessage,
+    ElectionMessage, ElectionOK, HeartbeatMessage, Operation, PrepareMessage,
+    RecoveryState, ReplicationAck, ReplicationState,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,9 +55,10 @@ class NodeClient:
         message = CoordinatorMessage(leader_id=self.settings.node_id, epoch=epoch)
         
         try:
-            response = await self.client.post(f"{self.settings.peers[peer_id]}/internal/coordinator", json=message.model_dump(), timeout=self.settings.request_timeout)
-            response.raise_for_status()
-        except httpx.HTTPError:
+            async with asyncio.timeout(self.settings.request_timeout):
+                response = await self.client.post(f"{self.settings.peers[peer_id]}/internal/coordinator", json=message.model_dump(), timeout=self.settings.request_timeout)
+                response.raise_for_status()
+        except (httpx.HTTPError, TimeoutError):
             logger.debug("COORDINATOR não entregue: node=%s peer=%s", self.settings.node_id, peer_id)
 
     async def replication_state(self, peer_id: int) -> ReplicationState:
@@ -72,6 +74,40 @@ class NodeClient:
             
         except (httpx.HTTPError, ValueError, TimeoutError) as error:
             raise NodeUnavailable(f"Estado de replicação indisponível: node={peer_id}") from error
+
+    async def recovery_state(self, peer_id: int) -> RecoveryState:
+        try:
+            async with asyncio.timeout(self.settings.request_timeout):
+                response = await self.client.get(
+                    f"{self.settings.peers[peer_id]}/internal/recovery/state",
+                    timeout=self.settings.request_timeout,
+                )
+                response.raise_for_status()
+                state = RecoveryState.model_validate(response.json())
+                if state.node_id != peer_id:
+                    raise ValueError("Log recebido de outro participante")
+                return state
+        except (httpx.HTTPError, ValueError, TimeoutError) as error:
+            raise NodeUnavailable(f"Log de recuperação indisponível: node={peer_id}") from error
+
+    async def send_configuration(self, peer_id: int, message: ConfigurationMessage,
+                                 phase: str) -> ConfigurationAck:
+        try:
+            async with asyncio.timeout(self.settings.request_timeout):
+                response = await self.client.post(
+                    f"{self.settings.peers[peer_id]}/internal/recovery/{phase}",
+                    json=message.model_dump(mode="json"), timeout=self.settings.request_timeout,
+                )
+                response.raise_for_status()
+                ack = ConfigurationAck.model_validate(response.json())
+                expected = "SYNCHRONIZED" if phase == "synchronize" else "CONFIRMED"
+                if (ack.node_id != peer_id or ack.configuration != message.configuration
+                        or ack.log_digest != message.log_digest or ack.tasks_digest != message.tasks_digest
+                        or ack.status != expected):
+                    raise ValueError("ACK não corresponde à configuração enviada")
+                return ack
+        except (httpx.HTTPError, ValueError, TimeoutError) as error:
+            raise NodeUnavailable(f"Configuração sem ACK válido: node={peer_id} phase={phase}") from error
 
     async def _replicate(self, peer_id: int, phase: str, operation: Operation) -> ReplicationAck:
         

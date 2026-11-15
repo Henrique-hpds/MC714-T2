@@ -76,6 +76,18 @@ class ReplicationAck(BaseModel):
     sequence_number: int = Field(strict=True, ge=1)
     status: Literal["PREPARED", "COMMITTED"]
 
+class ReplicationConfiguration(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    epoch: int = Field(strict=True, ge=1)
+    leader: int = Field(strict=True, gt=0)
+    members: tuple[Annotated[int, Field(strict=True, gt=0)], ...]
+
+    @model_validator(mode="after")
+    def validate_members(self):
+        if self.leader not in self.members or tuple(sorted(set(self.members))) != self.members:
+            raise ValueError("members deve ser ordenado, sem duplicatas e incluir o líder")
+        return self
+
 class ReplicationState(BaseModel):
     node_id: int
     leader_id: int | None
@@ -84,3 +96,24 @@ class ReplicationState(BaseModel):
     log_digest: str
     tasks_digest: str
     has_prepared: bool
+    configuration: ReplicationConfiguration | None
+    synchronized: bool
+
+class RecoveryState(ReplicationState):
+    operations: list[OperationRecord]
+
+class ConfigurationMessage(BaseModel):
+    sender_id: int = Field(strict=True, gt=0)
+    configuration: ReplicationConfiguration
+    log_digest: str
+    tasks_digest: str
+
+class SynchronizeMessage(ConfigurationMessage):
+    operations: list[OperationRecord]
+
+class ConfigurationAck(BaseModel):
+    node_id: int = Field(strict=True, gt=0)
+    configuration: ReplicationConfiguration
+    log_digest: str
+    tasks_digest: str
+    status: Literal["SYNCHRONIZED", "CONFIRMED"]

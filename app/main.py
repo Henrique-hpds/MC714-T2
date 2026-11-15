@@ -1,5 +1,4 @@
 """API de tarefas, coordenação e replicação entre os nós."""
-
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -16,8 +15,9 @@ from app.algorithms.replication import PrimaryBackup
 from app.communication.client import NodeClient
 from app.errors import ProtocolError
 from app.models import (
-    CommitMessage, CoordinatorMessage, ElectionMessage, HeartbeatMessage,
-    PrepareMessage, ReplicationAck, ReplicationState, RequestID, Task, TaskCreate, TaskUpdate,
+    CommitMessage, ConfigurationAck, ConfigurationMessage, CoordinatorMessage,
+    ElectionMessage, HeartbeatMessage, OperationRecord, PrepareMessage, RecoveryState, ReplicationAck,
+    ReplicationState, RequestID, SynchronizeMessage, Task, TaskCreate, TaskUpdate,
 )
 from app.state import NodeState
 from app.storage.database import Database
@@ -37,13 +37,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             async with httpx.AsyncClient(timeout=config.request_timeout, trust_env=False) as client:
                 app.state.client = client
-                app.state.node = NodeState(config.node_id, epoch=database.max_epoch())
+                app.state.node = NodeState(config.node_id, epoch=database.max_epoch(), configuration=database.load_configuration())
                 node_client = NodeClient(config, client)
                 app.state.bully = Bully(config, app.state.node, node_client)
-                app.state.heartbeat = Heartbeat(
-                    config, app.state.node, node_client, app.state.bully.start_election
-                )
-                app.state.replication = PrimaryBackup(config, app.state.node, node_client, database)
+                app.state.heartbeat = Heartbeat(config, app.state.node, node_client, app.state.bully.start_election)
+                app.state.replication = PrimaryBackup(config, app.state.node, node_client, database, lambda: app.state.heartbeat.suspected_nodes)
                 app.state.bully.start_election()
                 app.state.heartbeat.start()
                 app.state.replication.start()
@@ -82,6 +80,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def list_tasks(request: Request):
         return await request.app.state.replication.list_tasks()
 
+    @app.get("/operations/{request_id}", response_model=OperationRecord)
+    async def get_operation(request_id: RequestID, request: Request):
+        return await request.app.state.replication.get_operation(request_id)
+
     @app.put("/tasks/{task_id}", response_model=Task)
     async def update_task(task_id: str, command: TaskUpdate, request: Request, response: Response, request_id: Annotated[RequestID | None, Header(alias="Idempotency-Key")] = None):
         task, key = await request.app.state.replication.write(command, task_id, request_id)
@@ -99,6 +101,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/internal/replication/commit", response_model=ReplicationAck)
     async def receive_commit(message: CommitMessage, request: Request):
         return await request.app.state.replication.receive_commit(message)
+
+    @app.get("/internal/recovery/state", response_model=RecoveryState)
+    async def recovery_state(request: Request):
+        return request.app.state.replication.recovery_snapshot()
+
+    @app.post("/internal/recovery/synchronize", response_model=ConfigurationAck)
+    async def synchronize(message: SynchronizeMessage, request: Request):
+        return await request.app.state.replication.receive_synchronize(message)
+
+    @app.post("/internal/recovery/configure", response_model=ConfigurationAck)
+    async def configure_replication(message: ConfigurationMessage, request: Request):
+        return await request.app.state.replication.receive_configuration(message)
 
     @app.get("/health")
     async def health(request: Request):
@@ -123,11 +137,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Um nó indisponível não bloqueia as consultas aos demais participantes.
         responding = await asyncio.gather(*(check_peer(peer_id, url) for peer_id, url in config.peers.items() if peer_id != config.node_id))
         
+        node = request.app.state.node
         return {
             **request.app.state.node.snapshot(),
             "active_nodes": sorted([config.node_id] + [peer_id for peer_id in responding if peer_id is not None]),
             "suspected_nodes": sorted(request.app.state.heartbeat.suspected_nodes),
-            "replication_members": sorted(config.peers)
+            "replication_members": sorted(request.app.state.replication.recovery.members),
+            "configuration": node.configuration.model_dump(mode="json") if node.configuration else None,
+            "synchronized": node.synchronized
         }
 
     @app.post("/internal/heartbeat")

@@ -21,8 +21,8 @@ curl http://localhost:8001/status
 Com os três nós disponíveis, o Bully é iniciado automaticamente e elege o Node 3.
 Após a convergência, `/status` retorna `active_nodes: [1, 2, 3]`, `leader_id: 3`
 e o mesmo `epoch` nos três nós. O vencedor passa de `LEADER_ELECTED` a `PRIMARY`
-depois de verificar que todos os participantes reconhecem a liderança e possuem
-logs e tarefas iguais, sem operações pendentes. Os outros têm papel `BACKUP`.
+depois de recuperar os logs, sincronizar as tarefas dos sobreviventes e receber
+as confirmações da configuração de replicação. Os outros têm papel `BACKUP`.
 Durante a eleição, o papel é `ELECTING` e não há líder. Aguarde `PRIMARY` antes
 de enviar operações de tarefas; o healthcheck só indica que a API está acessível.
 O endpoint `POST /internal/message` recebe mensagens com `sender_id` e `message`.
@@ -56,7 +56,8 @@ As mensagens do protocolo usam IDs de `PEERS` e epochs inteiros positivos.
 antigos são ignorados; um nó de ID maior contesta candidatos de ID menor.
 O `epoch` identifica a liderança reconhecida e acompanha as mensagens de
 replicação. Na inicialização, o maior epoch do log persistido serve como piso
-para a eleição. A configuração de membros desta etapa é fixa: todos em `PEERS`.
+para a eleição, incluindo o epoch da configuração persistida. `PEERS` define os
+endereços conhecidos; a configuração de replicação identifica os membros atuais.
 
 ## Heartbeat — Etapa 3
 
@@ -74,9 +75,10 @@ As rotinas e os envios pendentes são cancelados no encerramento.
 
 Uma suspeita sobre o líder inicia o Bully automaticamente. A mesma suspeita
 não dispara eleições repetidas para a mesma liderança. Uma falha de backup
-apenas registra a suspeita e preserva o líder e o epoch. Um heartbeat válido
+preserva o líder; a recuperação estabelece um novo epoch com os sobreviventes,
+sem executar outra eleição. Um heartbeat válido
 posterior remove a suspeita; isso não representa uma reintegração ao conjunto
-de réplicas, cujo protocolo será implementado nas próximas etapas.
+de réplicas. A reintegração de nós reiniciados permanece fora do escopo.
 
 O `/status` inclui `suspected_nodes`, ordenado por ID. O campo `active_nodes`
 continua indicando quem respondeu às consultas de `/health`, sem alterar a
@@ -93,14 +95,16 @@ curl http://localhost:8002/status
 ```
 
 Aguarde a convergência: os Nodes 1 e 2 devem reconhecer `leader_id: 2`, com
-Node 2 em `LEADER_ELECTED` e `suspected_nodes: [3]`, sem chamadas manuais de
-eleição. O modelo assumido é crash-stop, sem partições de rede e com atrasos
+Node 2 em `PRIMARY`, `replication_members: [1, 2]`, `synchronized: true` e
+`suspected_nodes: [3]`, sem chamadas manuais de eleição. O modelo assumido é
+crash-stop, sem partições de rede e com atrasos
 compatíveis com os timeouts. Bully e Heartbeat não oferecem consenso ou proteção
 contra split-brain fora desse modelo.
 
-Para restaurar os três nós após o ensaio, execute `docker compose up -d --wait`.
-Se houver operações incompletas ou dados divergentes, a ativação permanece
-suspensa: recuperação e reintegração automática pertencem à Etapa 5.
+Cada ensaio considera uma falha de nó e termina com os sobreviventes. Para um
+novo ensaio com três nós e bancos vazios, remova os volumes com
+`docker compose down --volumes` (isso apaga as tarefas) e inicie o Compose
+novamente. Reiniciar apenas o nó excluído não realiza sua reintegração.
 
 ## Primary-Backup — Etapa 4
 
@@ -114,6 +118,7 @@ Durante eleição ou ativação pendente, o candidato responde HTTP 503.
 | `POST /tasks` | `{"title": "Implementar replicação"}` | Tarefa criada, HTTP 201 |
 | `GET /tasks` | Sem corpo | Lista de tarefas confirmadas |
 | `PUT /tasks/{id}` | `{"status": "completed"}` | Tarefa atualizada, HTTP 200 |
+| `GET /operations/{request_id}` | Sem corpo | Registro da operação, incluindo estado e resultado |
 
 As tarefas têm `id`, `title`, `status` e `version`. Os estados permitidos são
 `pending` (padrão), `in_progress` e `completed`. Uma atualização informa título,
@@ -164,14 +169,10 @@ aplicado o COMMIT. Repita a mesma entrada e chave para concluir a operação na
 mesma liderança. Enquanto houver uma operação pendente, novas escritas e
 leituras ficam suspensas, evitando exposição de uma escrita ainda incompleta.
 
-A configuração permanece fixa em todos os nós de `PEERS`, apresentada como
-`replication_members` em `/status`. `active_nodes` e `suspected_nodes` não mudam
-essa configuração. A falha de um backup impede confirmar escritas; a falha do
-primário ainda permite eleger um substituto, mas ele fica em `LEADER_ELECTED`
-porque não consegue validar todos os membros. Os dados confirmados permanecem
-nos bancos sobreviventes. Recuperar operações pendentes, sincronizar bancos
-divergentes e ativar uma nova configuração com menos membros são tarefas da
-Etapa 5.
+A configuração inicial inclui todos os nós de `PEERS`. Uma falha impede
+confirmar escritas nessa configuração até a recuperação estabelecer outra com
+os sobreviventes. O conjunto de ACKs exigidos é sempre o da configuração
+instalada, apresentado como `replication_members` em `/status`.
 
 Endpoints internos usados pelo protocolo:
 
@@ -180,6 +181,61 @@ Endpoints internos usados pelo protocolo:
 | `GET /internal/replication/state` | Liderança, hashes dos logs e tarefas e presença de operações pendentes |
 | `POST /internal/replication/prepare` | Persistir a operação antes de responder ACK |
 | `POST /internal/replication/commit` | Aplicar tarefa e confirmar operação antes de responder COMMIT ACK |
+
+## Integração e recuperação — Etapa 5
+
+O modelo adotado usa HTTP/TCP, comunicação parcialmente síncrona, relógio
+monotônico para timeouts, SQLite por nó e uma falha crash-stop por ensaio.
+Partições de rede, falsas suspeitas e reintegração de nós reiniciados ficam fora
+das garantias deste modelo. Bully e Heartbeat não são um protocolo de consenso.
+
+Quando o líder falha, o Heartbeat aciona o Bully. O vencedor fica em
+`LEADER_ELECTED`, com leituras e escritas de tarefas suspensas. O serviço de
+recuperação consulta os logs de todos os membros não suspeitos, preserva cada
+operação `COMMITTED` encontrada em qualquer sobrevivente e descarta operações
+que aparecem somente como `PREPARED`. Reconstrói as tarefas em ordem de epoch e
+sequência, validando payloads e versões. Logs conflitantes impedem a ativação.
+
+O candidato envia o snapshot recuperado aos backups. Cada destinatário valida
+os hashes e impede o descarte de operações já confirmadas. Log, tarefas e
+configuração são instalados na mesma transação SQLite. Uma segunda troca de
+mensagens confirma a configuração; o candidato só vira `PRIMARY` após receber
+todos os ACKs válidos. Falhas ou ACKs inválidos mantêm o candidato suspenso e
+provocam uma nova tentativa. A falha de um backup usa o mesmo procedimento,
+preservando o líder e aumentando o epoch. Uma falha HTTP isolada não remove
+membros: a exclusão depende das suspeitas do Heartbeat.
+
+O `/status` e o estado de replicação apresentam `configuration`, com `epoch`,
+`leader` e `members`, e `synchronized`. Após a falha do Node 3, os Nodes 1 e 2
+devem confirmar a mesma configuração com líder 2 e membros `[1, 2]`. Toda nova
+escrita exige PREPARE e COMMIT ACK do Node 1, além da persistência local no Node 2.
+Mensagens de replicação e recuperação de epochs anteriores são rejeitadas.
+`active_nodes` é apenas uma consulta de saúde e não altera os membros instalados.
+
+Uma requisição sem resposta pode ter sido efetivada. Consulte
+`GET /operations/{request_id}` no novo primário ou repita a entrada com a mesma
+`Idempotency-Key`: operações recuperadas devolvem o resultado original, inclusive
+para atualizações, sem incrementar a versão novamente. Operações descartadas
+retornam HTTP 404 na consulta e podem ser reenviadas com a mesma chave.
+
+Para demonstrar a continuidade após criar tarefas no Node 3:
+
+```bash
+docker compose stop node3
+# Aguarde PRIMARY e synchronized: true no Node 2.
+curl http://localhost:8002/status
+curl -X POST http://localhost:8002/tasks \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: request-after-failure' \
+  -d '{"title": "Validar continuidade após falha"}'
+curl http://localhost:8002/tasks
+```
+
+| Endpoint interno | Função |
+|---|---|
+| `GET /internal/recovery/state` | Consultar o log completo e a configuração local |
+| `POST /internal/recovery/synchronize` | Instalar o snapshot recuperado e a configuração pendente |
+| `POST /internal/recovery/configure` | Confirmar a configuração após validar os hashes |
 
 ## Testes
 
@@ -197,8 +253,11 @@ nova eleição, expiração e renovação dos heartbeats, isolamento de destinos
 validação da configuração e cancelamento de envios pendentes.
 Os testes de Primary-Backup usam um SQLite temporário independente por nó e
 cobrem persistência, atomicidade, criação e atualização, versões, serialização,
-idempotência, perda e falsificação de ACKs, timeouts, cancelamento, mudança de
-liderança durante escrita e bloqueio de ativação com logs divergentes.
+idempotência, perda e falsificação de ACKs, timeouts, cancelamento e mudança de
+liderança durante escrita. A integração cobre 100 tarefas antes e 100 depois da
+falha do primário, descarte de PREPARED, recuperação de COMMIT parcial, repetição
+de atualizações, falha de backup sem nova eleição, rejeição de epochs antigos,
+persistência da configuração e bloqueio até todos os ACKs de sincronização.
 
 Com os três contêineres em execução, valide também a comunicação pelo DNS do Compose:
 
@@ -215,9 +274,9 @@ Para um ensaio completo com processos independentes, execute:
 Esse script cria um projeto Compose isolado, sem portas publicadas ou volumes
 do ambiente de desenvolvimento. Verifica a ativação inicial do primário,
 criação e atualização de tarefas, idempotência e igualdade dos registros nos
-três nós. Também verifica eleições simultâneas e a eleição dos Nodes 2 e 1
-após interromper os líderes anteriores, preservando os dados confirmados e
-mantendo novas escritas suspensas até a implementação da Etapa 5.
+três nós. Também verifica eleições simultâneas, cria 100 tarefas, interrompe o
+Node 3, aguarda a ativação do Node 2 com membros `[1, 2]` e cria outras 100
+tarefas. Ao final, confere as 200 tarefas e os mesmos hashes nos sobreviventes.
 As eleições após falhas são acionadas automaticamente pelo Heartbeat, sem usar
 `/internal/election/start`. Os contêineres e a rede do ensaio são removidos ao final.
 

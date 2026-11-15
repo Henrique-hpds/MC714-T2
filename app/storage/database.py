@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from app.errors import ProtocolError
-from app.models import Operation, OperationRecord, Task, TaskCreate, TaskUpdate
+from app.models import Operation, OperationRecord, ReplicationConfiguration, Task, TaskCreate, TaskUpdate
 
 
 class Database:
@@ -31,6 +31,11 @@ class Database:
                 payload TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN ('PREPARED', 'COMMITTED')),
                 UNIQUE (epoch, sequence_number)
+            );
+            CREATE TABLE IF NOT EXISTS configuration (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                payload TEXT NOT NULL,
+                confirmed INTEGER NOT NULL CHECK (confirmed IN (0, 1))
             );
         """)
 
@@ -63,7 +68,60 @@ class Database:
         return self.connection.execute("SELECT 1 FROM operations WHERE status = 'PREPARED' LIMIT 1").fetchone() is not None
 
     def max_epoch(self) -> int:
-        return self.connection.execute("SELECT COALESCE(MAX(epoch), 0) FROM operations").fetchone()[0]
+        configuration = self.load_configuration()
+        return max(
+            self.connection.execute("SELECT COALESCE(MAX(epoch), 0) FROM operations").fetchone()[0],
+            configuration.epoch if configuration else 0,
+        )
+
+    def load_configuration(self) -> ReplicationConfiguration | None:
+        row = self.connection.execute("SELECT payload FROM configuration WHERE singleton = 1").fetchone()
+        return ReplicationConfiguration.model_validate_json(row[0]) if row else None
+
+    def _save_configuration(self, configuration: ReplicationConfiguration, confirmed: bool) -> None:
+        self.connection.execute(
+            "INSERT INTO configuration VALUES (1, ?, ?) ON CONFLICT(singleton) DO UPDATE SET "
+            "payload=excluded.payload, confirmed=excluded.confirmed",
+            (configuration.model_dump_json(), int(confirmed)),
+        )
+
+    def confirm_configuration(self, configuration: ReplicationConfiguration) -> None:
+        if self.load_configuration() != configuration or self.has_prepared():
+            raise ProtocolError(409, "Configuração ainda não sincronizada")
+        with self.connection:
+            self._save_configuration(configuration, confirmed=True)
+
+    def install_snapshot(self, operations: list[OperationRecord], configuration: ReplicationConfiguration,
+                         log_digest: str, tasks_digest: str) -> None:
+        """Valida por replay e troca log, tarefas e configuração numa transação."""
+        recovered = {record.request_id: record for record in operations}
+        for record in self.list_operations():
+            if record.status == "COMMITTED" and recovered.get(record.request_id) != record:
+                raise ProtocolError(409, "Sincronização descartaria uma operação confirmada")
+        # O replay isolado reutiliza a validação de sequência, payload e versão.
+        replica = Database(Path(":memory:"))
+        try:
+            for record in operations:
+                if record.status != "COMMITTED" or record.epoch > configuration.epoch:
+                    raise ProtocolError(409, "Snapshot deve conter apenas operações confirmadas de epochs válidos")
+                replica.prepare(Operation.model_validate(record.model_dump(exclude={"status"})))
+                replica.commit(record.request_id, record.epoch, record.sequence_number)
+            if len(recovered) != len(operations) or replica.digests() != (log_digest, tasks_digest):
+                raise ProtocolError(409, "Snapshot não corresponde aos hashes informados")
+            with self.connection:
+                self.connection.execute("DELETE FROM tasks")
+                self.connection.execute("DELETE FROM operations")
+                self.connection.executemany(
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?)",
+                    [tuple(row) for row in replica.connection.execute("SELECT * FROM tasks")],
+                )
+                self.connection.executemany(
+                    "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?)",
+                    [tuple(row) for row in replica.connection.execute("SELECT * FROM operations")],
+                )
+                self._save_configuration(configuration, confirmed=False)
+        finally:
+            replica.close()
 
     def next_sequence(self, epoch: int) -> int:
         return self.connection.execute(

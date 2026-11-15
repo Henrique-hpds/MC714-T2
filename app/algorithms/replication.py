@@ -1,33 +1,39 @@
-"""Primary-Backup síncrono com configuração fixa e confirmação de todos os nós.
-
-A recuperação de logs divergentes e a troca de membros pertencem à Etapa 5.
-PREPARED bloqueia novas escritas até uma repetição da mesma requisição concluir.
-"""
+"""Primary-Backup síncrono com recuperação e confirmação de todos os membros."""
 import asyncio
 import logging
+from collections.abc import Callable
 from contextlib import suppress
 from uuid import uuid4
 
 from app.communication.client import NodeClient, NodeUnavailable
 from app.config import Settings
 from app.errors import ProtocolError
-from app.models import CommitMessage, Operation, OperationPayload, PrepareMessage, ReplicationAck, ReplicationState, Task, TaskCreate, TaskUpdate
+from app.models import (
+    CommitMessage, ConfigurationAck, ConfigurationMessage, Operation, OperationPayload, OperationRecord,
+    PrepareMessage, RecoveryState, ReplicationAck, ReplicationState, SynchronizeMessage,
+    Task, TaskCreate, TaskUpdate,
+)
+from app.services.recovery import Recovery
 from app.state import NodeState
 from app.storage.database import Database
 
 logger = logging.getLogger(__name__)
 
 class PrimaryBackup:
-    def __init__(self, settings: Settings, state: NodeState, client: NodeClient, database: Database):
+    def __init__(self, settings: Settings, state: NodeState, client: NodeClient, database: Database,
+                 suspected_nodes: Callable[[], set[int]]):
         self.settings = settings
         self.state = state
         self.client = client
         self.database = database
         
-        # PEERS é a configuração fixa; suspeitas de Heartbeat não removem réplicas.
-        self.backups = sorted(set(settings.peers) - {settings.node_id})
+        self.recovery = Recovery(settings, state, client, database, suspected_nodes)
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
+
+    @property
+    def backups(self) -> list[int]:
+        return sorted(self.recovery.members - {self.state.node_id})
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._activate_when_ready(), name=f"replication-{self.state.node_id}")
@@ -40,53 +46,65 @@ class PrimaryBackup:
 
     def snapshot(self) -> ReplicationState:
         log_digest, tasks_digest = self.database.digests()
-        return ReplicationState(**self.state.snapshot(), log_digest=log_digest, tasks_digest=tasks_digest, has_prepared=self.database.has_prepared())
+        return ReplicationState(
+            **self.state.snapshot(), log_digest=log_digest, tasks_digest=tasks_digest,
+            has_prepared=self.database.has_prepared(), configuration=self.state.configuration,
+            synchronized=self.state.synchronized,
+        )
+
+    def recovery_snapshot(self) -> RecoveryState:
+        return RecoveryState(**self.snapshot().model_dump(), operations=self.database.list_operations())
+
+    async def receive_synchronize(self, message: SynchronizeMessage) -> ConfigurationAck:
+        async with self._lock:
+            return self.recovery.synchronize(message)
+
+    async def receive_configuration(self, message: ConfigurationMessage) -> ConfigurationAck:
+        async with self._lock:
+            return self.recovery.configure(message)
 
     async def _activate_when_ready(self) -> None:
         while True:
-            if self.state.role == "LEADER_ELECTED":
+            if self.recovery.needed():
                 await self.activate()
             await asyncio.sleep(min(0.1, self.settings.heartbeat_interval))
 
     async def activate(self) -> None:
         async with self._lock:
-            local = self.snapshot()
-            if local.role != "LEADER_ELECTED" or local.has_prepared:
-                return
-            
-            answers = await asyncio.gather(*(self.client.replication_state(peer) for peer in self.backups), return_exceptions=True)
-            
-            for answer in answers:
-                if isinstance(answer, NodeUnavailable):
-                    return
-                if isinstance(answer, BaseException):
-                    raise answer                
-                if answer.leader_id != local.node_id or answer.epoch != local.epoch:
-                    return
-                if answer.role != "BACKUP" or answer.has_prepared:
-                    return
-                if answer.log_digest != local.log_digest or answer.tasks_digest != local.tasks_digest:
-                    return
-                
-            if self.state.role == "LEADER_ELECTED" and self.state.epoch == local.epoch and self.state.leader_id == local.node_id:
-                self.state.role = "PRIMARY"
-                logger.info("PRIMARY node=%s epoch=%s members=%s", local.node_id, local.epoch, sorted(self.settings.peers))
+            await self.recovery.recover()
 
     def _require_primary(self, epoch: int | None = None) -> None:
         if self.state.leader_id is not None and self.state.leader_id != self.state.node_id:
             raise ProtocolError(409, "Acesse o líder indicado para ler ou escrever tarefas")
-        if self.state.role != "PRIMARY" or (epoch is not None and self.state.epoch != epoch):
+        if (self.state.role != "PRIMARY" or not self.state.synchronized
+                or self.state.configuration is None or self.state.configuration.epoch != self.state.epoch
+                or (epoch is not None and self.state.epoch != epoch)):
             raise ProtocolError(503, "Primário indisponível; eleição ou sincronização pendente")
 
     async def list_tasks(self) -> list[Task]:
+        self._require_primary()
         async with self._lock:
             self._require_primary()
             if self.database.has_prepared():
                 raise ProtocolError(503, "Resultado de escrita pendente; repita a requisição com a mesma Idempotency-Key")
             return self.database.list_tasks()
 
+    async def get_operation(self, request_id: str) -> OperationRecord:
+        self._require_primary()
+        async with self._lock:
+            self._require_primary()
+            operation = self.database.get_operation(request_id)
+            if operation is None:
+                raise ProtocolError(404, "Operação não encontrada; a requisição pode ser repetida com a mesma chave")
+            return operation
+
     def _require_leader(self, sender_id: int, epoch: int) -> None:
-        if (sender_id not in self.settings.peers or sender_id == self.state.node_id or self.state.role != "BACKUP" or self.state.leader_id != sender_id or epoch != self.state.epoch):
+        configuration = self.state.configuration
+        if (configuration is None or not self.state.synchronized
+                or sender_id not in configuration.members or self.state.node_id not in configuration.members
+                or configuration.leader != sender_id or configuration.epoch != epoch
+                or sender_id == self.state.node_id or self.state.role != "BACKUP"
+                or self.state.leader_id != sender_id or epoch != self.state.epoch):
             raise ProtocolError(409, "Replicação rejeitada: líder ou epoch não corresponde à liderança reconhecida")
 
     async def receive_prepare(self, message: PrepareMessage) -> ReplicationAck:
@@ -121,6 +139,7 @@ class PrimaryBackup:
         request_id = request_id or str(uuid4())
         
         try:
+            self._require_primary()
             async with self._lock:
                 self._require_primary()
                 operation_type = "CREATE" if task_id is None else "UPDATE"
