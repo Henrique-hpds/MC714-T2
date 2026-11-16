@@ -1,11 +1,4 @@
-.git
-.venv
-.env
-.env.*
+*
+!app
+!requirements.txt
 **/__pycache__
-**/*.pyc
-tests
-experiments
-*.md
-__pycache__
-experiments/results
