@@ -269,10 +269,14 @@ def scenario_hb(failure_timeout: float, seed: int, run_dir: Path, args) -> dict:
         stop, rows = threading.Event(), []
 
         def load():
-            client, i = TaskClient(cluster, n), 0
+            # Taxa fixa: carga contínua sem limite gera um log de milhares de operações, cujo
+            # replay na recuperação excede o REQUEST_TIMEOUT (limitação documentada).
+            client, i, next_at = TaskClient(cluster, n), 0, time.time()
             while not stop.is_set():
                 rows.extend(write_tasks(client, 1, f"hb-{seed}-{i}", rng))
                 i += 1
+                next_at += 1 / args.load_rate
+                stop.wait(max(0.0, next_at - time.time()))
 
         before = cluster.metrics(range(1, n + 1))
         window_start = time.time()
@@ -403,7 +407,7 @@ def main(args):
                       "heartbeat_interval": args.heartbeat_interval, "failure_timeout": args.failure_timeout,
                       "request_timeout": args.request_timeout, "coordinator_timeout": args.coordinator_timeout,
                       "ops": args.ops, "warmup_ops": args.warmup_ops, "pre_tasks": args.pre_tasks,
-                      "window_s": args.window, "hb_nodes": args.hb_nodes, "image_id": env_info["image_id"],
+                      "window_s": args.window, "load_rate": args.load_rate, "hb_nodes": args.hb_nodes, "image_id": env_info["image_id"],
                       "git_commit": env_info["git_commit"]}
             started = time.time()
             try:
@@ -430,6 +434,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-ops", type=int, default=50, help="PB: escritas de aquecimento descartadas")
     parser.add_argument("--pre-tasks", type=int, default=20, help="Bully: tarefas criadas antes da falha")
     parser.add_argument("--window", type=float, default=60.0, help="HB: janela estável sob carga (s)")
+    parser.add_argument("--load-rate", type=float, default=10.0, help="HB: escritas/s durante a janela")
     parser.add_argument("--hb-nodes", type=int, default=3, help="HB: número de nós")
     parser.add_argument("--heartbeat-interval", type=float, default=0.5)
     parser.add_argument("--failure-timeout", type=float, default=3.0, help="Bully/PB: FAILURE_TIMEOUT")
