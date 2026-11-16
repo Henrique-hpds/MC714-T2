@@ -1,86 +1,70 @@
-"""Detector de suspeitas por ausência de heartbeats recebidos via HTTP."""
+"""Detector de falhas: suspeita de um nó que passa mais de FAILURE_TIMEOUT sem enviar heartbeats."""
 import asyncio
 import logging
 import time
-from collections.abc import Callable
-from contextlib import suppress
 
+from app.algorithms.bully import Bully
 from app.communication.client import NodeClient
 from app.config import Settings
 from app.state import NodeState
 
 logger = logging.getLogger(__name__)
 
+CHECK_INTERVAL = 0.1
+
+
 class Heartbeat:
-    def __init__(self, settings: Settings, state: NodeState, client: NodeClient, on_leader_failure: Callable[[], None]):
+    def __init__(self, settings: Settings, state: NodeState, client: NodeClient, bully: Bully):
         self.settings = settings
         self.state = state
         self.client = client
-        self.on_leader_failure = on_leader_failure
-        
-        # Dá um timeout inicial completo a quem ainda não enviou heartbeat.
+        self.bully = bully
+        self.peers = [peer for peer in settings.peers if peer != settings.node_id]
+        # O prazo começa a contar na inicialização, para que nenhum nó seja suspeito antes de enviar o primeiro heartbeat.
         now = time.monotonic()
-        self.last_received = {peer_id: now for peer_id in settings.peers if peer_id != settings.node_id}
-        self.suspected_nodes: set[int] = set()
-        self._last_failed_leader: tuple[int, int] | None = None
-        self._tasks: list[asyncio.Task] = []
+        self.last_received = {peer: now for peer in self.peers}
+        self.suspected = set()
+        self.failed_leader = None
+        self.tasks = []
 
     def start(self) -> None:
-        if not self._tasks:
-            self._tasks = [
-                asyncio.create_task(self.send_heartbeats(), name=f"heartbeat-send-{self.state.node_id}"),
-                asyncio.create_task(self.monitor_nodes(), name=f"heartbeat-monitor-{self.state.node_id}")
-            ]
+        # Um laço de envio por destino, para que um nó lento não atrase os heartbeats aos demais.
+        self.tasks = [asyncio.create_task(self._send_loop(peer)) for peer in self.peers]
+        self.tasks.append(asyncio.create_task(self._monitor_loop()))
 
     def receive(self, sender_id: int) -> None:
-        """O endpoint valida o participante antes de renovar seu prazo local."""
         self.last_received[sender_id] = time.monotonic()
-        
-        if sender_id in self.suspected_nodes:
-            self.suspected_nodes.remove(sender_id)
-            self.client.metrics.event("UNSUSPECTED", peer=sender_id)
-            
-            if self._last_failed_leader is not None and self._last_failed_leader[0] == sender_id:
-                self._last_failed_leader = None
-            logger.info("HEARTBEAT retomado: node=%s peer=%s", self.state.node_id, sender_id)
+        if sender_id in self.suspected:
+            self.suspected.remove(sender_id)
+            if self.failed_leader is not None and self.failed_leader[0] == sender_id:
+                self.failed_leader = None
+            logger.info("UNSUSPECTED node=%s peer=%s", self.state.node_id, sender_id)
 
-    async def send_heartbeats(self) -> None:
-        async def send_to_peer(peer_id: int) -> None:
-            while True:
-                started = time.monotonic()
-                await self.client.send_heartbeat(peer_id)
-                elapsed = time.monotonic() - started
-                await asyncio.sleep(max(0, self.settings.heartbeat_interval - elapsed))
-
-        # Cada destino tem sua própria cadência; um envio lento não atrasa os demais.
-        await asyncio.gather(*(send_to_peer(peer_id) for peer_id in self.last_received))
-
-    async def monitor_nodes(self) -> None:
-        interval = min(0.1, self.settings.heartbeat_interval, self.settings.failure_timeout / 2)
+    async def _send_loop(self, peer_id: int) -> None:
         while True:
-            self.check_failures()
-            await asyncio.sleep(interval)
+            started = time.monotonic()
+            await self.client.send_heartbeat(peer_id)
+            # Desconta a duração do envio para manter a cadência de HEARTBEAT_INTERVAL.
+            await asyncio.sleep(max(0, self.settings.heartbeat_interval - (time.monotonic() - started)))
 
-    def check_failures(self) -> None:
+    async def _monitor_loop(self) -> None:
+        while True:
+            self._check_peers()
+            self._check_leader()
+            await asyncio.sleep(CHECK_INTERVAL)
+
+    def _check_peers(self) -> None:
         now = time.monotonic()
-        for peer_id, last_received in self.last_received.items():
-            if now - last_received > self.settings.failure_timeout and peer_id not in self.suspected_nodes:
-                self.suspected_nodes.add(peer_id)
-                # silence: tempo local desde o último heartbeat recebido do participante.
-                self.client.metrics.event("SUSPECTED", peer=peer_id, silence=now - last_received,
-                                          is_leader=peer_id == self.state.leader_id)
-                logger.info("SUSPECTED node=%s peer=%s", self.state.node_id, peer_id)
+        for peer, last in self.last_received.items():
+            if peer not in self.suspected and now - last > self.settings.failure_timeout:
+                self.suspected.add(peer)
+                self.client.metrics.event("SUSPECTED", peer=peer, silence=now - last)
+                logger.info("SUSPECTED node=%s peer=%s", self.state.node_id, peer)
 
-        leader_id = self.state.leader_id
-        if leader_id is not None and leader_id in self.suspected_nodes:
-            leadership = (leader_id, self.state.epoch)
-            if leadership != self._last_failed_leader:
-                self._last_failed_leader = leadership
-                self.on_leader_failure()
-
-    async def close(self) -> None:
-        for task in self._tasks:
-            task.cancel()
-        for task in self._tasks:
-            with suppress(asyncio.CancelledError):
-                await task
+    def _check_leader(self) -> None:
+        leadership = (self.state.leader_id, self.state.epoch)
+        # A suspeita continua ativa nas verificações seguintes; guardar (líder, epoch) evita
+        # iniciar uma eleição a cada verificação.
+        if self.state.leader_id in self.suspected and leadership != self.failed_leader:
+            self.failed_leader = leadership
+            self.bully.start_election()
