@@ -103,3 +103,7 @@ já registradas são puladas, então uma malha interrompida continua de onde par
 
 `analyze_results.py` não tem opções: lê `experiments/results/raw`, gera
 `relatorio/images/bully_mensagens.pdf` e imprime as médias ± IC95 citadas no relatório.
+
+Os resultados do relatório foram obtidos com Docker 29.9.3 e Docker Compose 5.7.1. A imagem dos
+nós usa Python 3.13.18, FastAPI 0.163.1, Uvicorn 0.54.0, HTTPX 0.28.1 e SQLite 3.46.1, versões
+fixadas no `Dockerfile` e no `requirements.txt`.

@@ -47,7 +47,7 @@ class NodeClient:
         """Retorna a resposta em JSON, ou None se o nó não respondeu com sucesso dentro do prazo."""
         self.metrics.sent[kind] += 1
         try:
-            # O timeout do httpx vale para cada fase (conexão, leitura...); este limita a duração total.
+            # O timeout do httpx vale para cada fase (conexão, leitura...), este limita a duração total
             async with asyncio.timeout(self.settings.request_timeout):
                 response = await self.http.request(method, f"{self.settings.peers[peer_id]}{path}", json=body)
             response.raise_for_status()

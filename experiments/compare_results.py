@@ -1,7 +1,7 @@
 """Compara duas execuções da malha de experimentos (máquinas diferentes).
 
 Para cada cenário presente nas duas pastas e cada nível, compara as métricas principais:
-média ± IC95 em A e B, diferença relativa (B−A)/A e teste t de Welch (|t| > t_crit → diferença
+média ± IC95 em A e B, diferença relativa (B-A)/A e teste t de Welch (|t| > t_crit → diferença
 significativa a 95%). Também lista diferenças de configuração/ambiente entre as execuções.
 
 Saídas em <out>/:

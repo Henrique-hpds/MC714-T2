@@ -12,6 +12,11 @@ PROJECT = "mc714-exp"
 BASE_PORT = 18000
 COMPOSE_FILE = Path(__file__).parent / "results" / "compose.json"
 CONVERGENCE_TIMEOUT = 90.0
+HEALTHCHECK = {
+    "test": ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=1)"],
+    "interval": "1s", "timeout": "2s", "start_period": "5s", "retries": 30,
+}
 
 
 def run(*command: str) -> None:
@@ -26,7 +31,7 @@ class Cluster:
     def __init__(self, n: int, failure_timeout: float):
         self.n = n
         self.failure_timeout = failure_timeout
-        # Conexões persistentes: a latência medida não inclui a abertura de uma conexão por escrita.
+        # a latência medida não inclui a abertura de uma conexão por escrita.
         self.http = httpx.Client(timeout=10.0, trust_env=False)
 
     def up(self) -> None:
@@ -39,13 +44,14 @@ class Cluster:
                 "environment": {"NODE_ID": str(i), "PEERS": peers, "DB_PATH": "/data/tasks.db",
                                 "FAILURE_TIMEOUT": str(self.failure_timeout)},
                 "ports": [f"127.0.0.1:{BASE_PORT + i}:8000"],
+                "healthcheck": HEALTHCHECK,
             }
         COMPOSE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # JSON também é YAML válido, então o Compose lê o arquivo diretamente.
+        # Compose lê o arquivo diretamente
         COMPOSE_FILE.write_text(json.dumps({"name": PROJECT, "services": services}))
-        # Remove contêineres que uma execução interrompida tenha deixado, inclusive de outro N.
+        # Remove containers que uma execução interrompida tenha deixado
         self._compose("down", "-v", "--remove-orphans", "-t", "1")
-        self._compose("up", "-d")
+        self._compose("up", "-d", "--wait", "--wait-timeout", "120")
 
     def down(self) -> None:
         self.http.close()
@@ -55,7 +61,6 @@ class Cluster:
         run("docker", "compose", "-f", str(COMPOSE_FILE), *args)
 
     def kill(self, node: int) -> None:
-        # SIGKILL: o processo para sem aviso e as conexões a ele passam a ser recusadas.
         run("docker", "kill", "-s", "KILL", f"{PROJECT}-node{node}")
 
     def get(self, node: int, path: str):

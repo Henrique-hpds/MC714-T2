@@ -26,7 +26,7 @@ COLUMNS = {
            "silence_max_s", "false_suspicions", "heartbeats_per_node_s"],
 }
 HEARTBEAT_INTERVAL = 0.5  # padrão do app
-FAILURE_TIMEOUT = 3.0     # Bully e Primary-Backup; no Heartbeat é o parâmetro variado
+FAILURE_TIMEOUT = 3.0     # bully e pb, no heartbeat é variado
 PRE_TASKS = 20
 WARMUP_OPS = 50
 OPS = 1000
@@ -41,7 +41,6 @@ def write_tasks(cluster: Cluster, node: int, count: int, prefix: str, rng: rando
 
 
 def write_at_rate(cluster: Cluster, node: int, prefix: str, rng: random.Random) -> None:
-    # Taxa fixa: uma carga sem limite gera um log de milhares de operações e alonga a recuperação.
     end = time.time() + WINDOW
     next_at = time.time()
     i = 0
@@ -54,7 +53,7 @@ def write_at_rate(cluster: Cluster, node: int, prefix: str, rng: random.Random) 
 
 def kill_leader(cluster: Cluster, rng: random.Random) -> tuple[float, float, bool]:
     """Encerra o líder (nó N) e espera os sobreviventes convergirem para o nó N-1."""
-    # Atraso aleatório para que a falha ocorra em qualquer ponto do ciclo de heartbeat.
+    # Atraso aleatório para que a falha ocorra em qualquer ponto do ciclo de heartbeat
     time.sleep(rng.uniform(0, HEARTBEAT_INTERVAL))
     killed_at = time.time()
     cluster.kill(cluster.n)
@@ -101,7 +100,7 @@ def scenario_bully(cluster: Cluster, seed: int) -> dict:
         return {"ok": False, "kill_s": kill_s}
     after = cluster.metrics(survivors)
     epoch = cluster.get(n - 1, "/status")["epoch"]
-    # O novo primário mantém as tarefas confirmadas e volta a aceitar escritas.
+    # novo primário mantém tarefas confirmadas e volta aceitar escritas
     writes += write_tasks(cluster, n - 1, 1, f"bully-{n}-{seed}-post", rng)
     tasks = cluster.get(n - 1, "/tasks")
     ok = all(status == 201 for status, _ in writes) and len(tasks) == PRE_TASKS + 1 and consistent(cluster, survivors)
@@ -156,7 +155,7 @@ def scenario_hb(cluster: Cluster, seed: int) -> dict:
             suspicions.setdefault(event["node"], event)
     silences = [event["silence"] for event in suspicions.values()]
     return {
-        # Todos os sobreviventes suspeitam do líder, e só depois de T segundos sem heartbeats.
+        # todos os sobreviventes suspeitam do lider só depois de T segundos sem heartbeats
         "ok": converged and len(suspicions) == n - 1 and min(silences) > cluster.failure_timeout,
         "kill_s": kill_s,
         "detection_s": min(event["t"] for event in suspicions.values()) - killed_at,
@@ -176,7 +175,7 @@ def run_once(experiment: str, level: float, seed: int) -> dict:
     started = time.time()
     try:
         cluster.up()
-        # A medição só começa depois da eleição inicial e da ativação do primário.
+        # medição só começa depois da eleição inicial e ativação do primário
         ready_at = cluster.wait_converged(list(range(1, n + 1)), n)
         if ready_at is None:
             raise RuntimeError(f"{experiment} {level} seed={seed}: o cluster não convergiu na inicialização")
@@ -214,7 +213,7 @@ def main() -> None:
     for experiment in LEVELS if args.exp == "all" else [args.exp]:
         path = out / f"{experiment}.csv"
         done = completed(path)
-        # Níveis intercalados em cada semente, para que uma deriva da máquina não se confunda com o nível.
+        # intercalados em cada semente
         for seed in SEEDS[:args.reps]:
             for level in LEVELS[experiment]:
                 if (str(level), str(seed)) in done:

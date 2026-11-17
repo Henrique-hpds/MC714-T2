@@ -222,7 +222,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-experiments/results
+experiments/results/*
+!experiments/results/raw/
 relatorio/
 instrucoes/
 trabalho1
